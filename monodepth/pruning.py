@@ -281,11 +281,11 @@ def main():
             train(args, model, device, train_loader, optimizer, epoch, lr_scheduler, mask)
 
             monodepth.epoch = epoch
-            monodepth.save_model()
+            
 
             if not args.dense and epoch < args.epochs:
                 mask.at_end_of_epoch()
-
+            monodepth.save_model()
             print_and_log('Current learning rate: {0}. Time taken for epoch: {1:.2f} seconds.\n'.format(
                 optimizer.param_groups[0]['lr'], time.time() - t0))
 
