@@ -6,8 +6,6 @@
 
 from __future__ import absolute_import, division, print_function
 
-import math
-
 import numpy as np
 import time
 
@@ -18,24 +16,18 @@ from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 
 import json
-from utils import AverageMeter
+
 from utils import *
 from kitti_utils import *
 from layers import *
+
 import datasets
 import networks
 from IPython import embed
-from sparselearning.core import CosineDecay, Masking
-
-# Copyright Niantic 2019. Patent Pending. All rights reserved.
-#
-# This software is licensed under the terms of the Monodepth2 licence
-# which allows for non-commercial use only, the full terms of which are made
-# available in the LICENSE file.
 
 
 class Trainer:
-    def __init__(self, options, train_loader=None, val_loader=None):
+    def __init__(self, options):
         self.opt = options
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
 
@@ -45,10 +37,8 @@ class Trainer:
 
         self.models = {}
         self.parameters_to_train = []
-        self.epoch = self.opt.current_epoch
-        self.step = 0
-        self.start_time = time.time()
-        self.device = torch.device("cpu" if self.opt.no_cuda or not torch.cuda.is_available() else "cuda")
+
+        self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
 
         self.num_scales = len(self.opt.scales)
         self.num_input_frames = len(self.opt.frame_ids)
@@ -65,6 +55,7 @@ class Trainer:
             self.opt.num_layers, self.opt.weights_init == "pretrained")
         self.models["encoder"].to(self.device)
         self.parameters_to_train += list(self.models["encoder"].parameters())
+
         self.models["depth"] = networks.DepthDecoder(
             self.models["encoder"].num_ch_enc, self.opt.scales)
         self.models["depth"].to(self.device)
@@ -108,11 +99,12 @@ class Trainer:
             self.models["predictive_mask"].to(self.device)
             self.parameters_to_train += list(self.models["predictive_mask"].parameters())
 
-        self.model_optimizer = optim.SGD(self.parameters_to_train, lr=self.opt.lr, momentum=self.opt.momentum, weight_decay=self.opt.weight_decay)
-        #self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
-
+        self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
             self.model_optimizer, self.opt.scheduler_step_size, 0.1)
+
+        if self.opt.load_weights_folder is not None:
+            self.load_model()
 
         print("Training model named:\n  ", self.opt.model_name)
         print("Models and tensorboard events files are saved to:\n  ", self.opt.log_dir)
@@ -128,31 +120,24 @@ class Trainer:
         train_filenames = readlines(fpath.format("train"))
         val_filenames = readlines(fpath.format("val"))
         img_ext = '.png' if self.opt.png else '.jpg'
-        #train_filenames = train_filenames[:50]
+
         num_train_samples = len(train_filenames)
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
 
         train_dataset = self.dataset(
             self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
-        if train_loader is None:
-            self.train_loader = DataLoader(
-                train_dataset, self.opt.batch_size, True,
-                num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
-        else:
-            self.train_loader = train_loader
+        self.train_loader = DataLoader(
+            train_dataset, self.opt.batch_size, True,
+            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
         val_dataset = self.dataset(
             self.opt.data_path, val_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=False, img_ext=img_ext)
-        if val_loader is None:
-            self.val_loader = DataLoader(
-                val_dataset, self.opt.batch_size, True,
-                num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
-        else:
-            self.val_loader = val_loader
+        self.val_loader = DataLoader(
+            val_dataset, self.opt.batch_size, True,
+            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
         self.val_iter = iter(self.val_loader)
-        if self.opt.load_weights_folder is not None:
-            self.load_model()
+
         self.writers = {}
         for mode in ["train", "val"]:
             self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
@@ -179,16 +164,7 @@ class Trainer:
         print("Using split:\n  ", self.opt.split)
         print("There are {:d} training items and {:d} validation items\n".format(
             len(train_dataset), len(val_dataset)))
-        self.mask = None
-        if not self.opt.dense:
 
-            decay = CosineDecay(self.opt.prune_rate, len(self.train_loader) * (self.opt.num_epochs))
-            self.mask = Masking(self.model_optimizer, decay, prune_rate=self.opt.prune_rate, prune_mode=self.opt.prune,
-                           growth_mode=self.opt.growth,
-                           redistribution_mode=self.opt.redistribution,
-                           verbose=self.opt.verbose, fp16=False)
-            print("Using mask:\n  ", self.mask.prune_mode)
-            self.mask.add_module(self.models['encoder'], density=self.opt.density)
         self.save_opts()
 
     def set_train(self):
@@ -206,16 +182,13 @@ class Trainer:
     def train(self):
         """Run the entire training pipeline
         """
-        self.epoch = self.opt.current_epoch
+        self.epoch = 0
         self.step = 0
         self.start_time = time.time()
-        for self.epoch in range(self.opt.current_epoch,self.opt.num_epochs):
+        for self.epoch in range(self.opt.num_epochs):
             self.run_epoch()
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
-            if not self.opt.dense and self.epoch < self.opt.num_epochs:
-                self.mask.at_end_of_epoch()
-                self.save_model('pruned')
 
     def run_epoch(self):
         """Run a single epoch of training and validation
@@ -226,24 +199,21 @@ class Trainer:
         self.set_train()
 
         for batch_idx, inputs in enumerate(self.train_loader):
-            
+
             before_op_time = time.time()
 
             outputs, losses = self.process_batch(inputs)
 
             self.model_optimizer.zero_grad()
             losses["loss"].backward()
-            if self.mask is not None:
-                self.mask.step()
-            else:
-                self.model_optimizer.step()
+            self.model_optimizer.step()
 
             duration = time.time() - before_op_time
 
             # log less frequently after the first 2000 steps to save time & disk space
             early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 2000
             late_phase = self.step % 2000 == 0
-            self.log_time(batch_idx, duration, losses["loss"].cpu().data)
+
             if early_phase or late_phase:
                 self.log_time(batch_idx, duration, losses["loss"].cpu().data)
 
@@ -254,9 +224,6 @@ class Trainer:
                 self.val()
 
             self.step += 1
-
-
-
 
     def process_batch(self, inputs):
         """Pass a minibatch through the network and generate images and losses
@@ -350,6 +317,27 @@ class Trainer:
 
         return outputs
 
+    def val(self):
+        """Validate the model on a single minibatch
+        """
+        self.set_eval()
+        try:
+            inputs = self.val_iter.next()
+        except StopIteration:
+            self.val_iter = iter(self.val_loader)
+            inputs = self.val_iter.next()
+
+        with torch.no_grad():
+            outputs, losses = self.process_batch(inputs)
+
+            if "depth_gt" in inputs:
+                self.compute_depth_losses(inputs, outputs, losses)
+
+            self.log("val", inputs, outputs, losses)
+            del inputs, outputs, losses
+
+        self.set_train()
+
     def generate_images_pred(self, inputs, outputs):
         """Generate the warped (reprojected) color images for a minibatch.
         Generated images are saved into the `outputs` dictionary.
@@ -376,6 +364,7 @@ class Trainer:
 
                 # from the authors of https://arxiv.org/abs/1712.00175
                 if self.opt.pose_model_type == "posecnn":
+
                     axisangle = outputs[("axisangle", 0, frame_id)]
                     translation = outputs[("translation", 0, frame_id)]
 
@@ -490,7 +479,7 @@ class Trainer:
 
             if not self.opt.disable_automasking:
                 outputs["identity_selection/{}".format(scale)] = (
-                        idxs > identity_reprojection_loss.shape[1] - 1).float()
+                    idxs > identity_reprojection_loss.shape[1] - 1).float()
 
             loss += to_optimise.mean()
 
@@ -542,9 +531,9 @@ class Trainer:
         samples_per_sec = self.opt.batch_size / duration
         time_sofar = time.time() - self.start_time
         training_time_left = (
-                                     self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
+            self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
         print_string = "epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
-                       " | loss: {:.5f} | time elapsed: {} | time left: {}"
+            " | loss: {:.5f} | time elapsed: {} | time left: {}"
         print(print_string.format(self.epoch, batch_idx, samples_per_sec, loss,
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
@@ -593,10 +582,10 @@ class Trainer:
         with open(os.path.join(models_dir, 'opt.json'), 'w') as f:
             json.dump(to_save, f, indent=2)
 
-    def save_model(self,mode="models"):
+    def save_model(self):
         """Save model weights to disk
         """
-        save_folder = os.path.join(self.log_path, mode, "weights_{}".format(self.epoch))
+        save_folder = os.path.join(self.log_path, "models", "weights_{}".format(self.epoch))
         if not os.path.exists(save_folder):
             os.makedirs(save_folder)
 
@@ -610,10 +599,6 @@ class Trainer:
                 to_save['use_stereo'] = self.opt.use_stereo
             torch.save(to_save, save_path)
 
-        self.save_opt(mode)
-
-    def save_opt(self,mode="models"):
-        save_folder = os.path.join(self.log_path, mode, "weights_{}".format(self.epoch))
         save_path = os.path.join(save_folder, "{}.pth".format("adam"))
         torch.save(self.model_optimizer.state_dict(), save_path)
 
@@ -636,79 +621,10 @@ class Trainer:
             self.models[n].load_state_dict(model_dict)
 
         # loading adam state
-
         optimizer_load_path = os.path.join(self.opt.load_weights_folder, "adam.pth")
-        print(optimizer_load_path)
         if os.path.isfile(optimizer_load_path):
             print("Loading Adam weights")
             optimizer_dict = torch.load(optimizer_load_path)
             self.model_optimizer.load_state_dict(optimizer_dict)
         else:
             print("Cannot find Adam weights so Adam is randomly initialized")
-            # self.init_optimizer()
-
-
-    def val(self):
-        """Validate the model on a single minibatch
-        """
-        
-
-        # top1 = AverageMeter('top1')
-        self.set_eval()
-        try:
-            inputs = self.val_iter.next()
-        except StopIteration:
-            self.val_iter = iter(self.val_loader)
-            inputs = self.val_iter.next()
-
-        with torch.no_grad():
-            outputs, losses = self.process_batch(inputs)
-            # top1.update(outputs[('disp', 3)].data,inputs['depth_gt'].size(0))
-            
-            if "depth_gt" in inputs:
-                self.compute_depth_losses(inputs, outputs, losses)
-            
-            
-
-            self.log("val", inputs, outputs, losses)
-            
-            del inputs, outputs, losses
-
-        self.set_train()
-
-    def get_momentum_for_weight(self, weight):
-        # print('self.model_optimizer.state[weight]',self.model_optimizer.state.keys())
-        # grad = weight
-        if 'exp_avg' in self.model_optimizer.state[weight]:
-            adam_m1 = self.model_optimizer.state[weight]['exp_avg']
-            adam_m2 = self.model_optimizer.state[weight]['exp_avg_sq']
-            grad = adam_m1 / (torch.sqrt(adam_m2) + 1e-08)
-        elif 'momentum_buffer' in self.model_optimizer.state[weight]:
-            grad = self.model_optimizer.state[weight]['momentum_buffer']
-
-        return grad
-
-    def momentum_redistribution(self, weight, mask):
-
-        grad = self.get_momentum_for_weight(weight)
-        mean_magnitude = torch.abs(grad[mask.bool()]).mean().item()
-
-        return mean_magnitude
-
-    def adjust_learning_rate(self):
-
-        if self.epoch in self.opt.schedule:
-            state['lr'] *= self.opt.gamma
-            for param_group in self.model_optimizer.param_groups:
-                param_group['lr'] = state['lr']
-
-    def pruning(self, mode='constant'):
-        self.epoch = self.opt.current_epoch
-        self.step = 0
-        self.start_time = time.time()
-        for self.epoch in range(self.opt.current_epoch,self.opt.num_epochs):
-            
-            if not self.opt.dense and self.epoch < self.opt.num_epochs:
-                self.mask.at_end_of_epoch()
-                self.save_model('pruned')
-
