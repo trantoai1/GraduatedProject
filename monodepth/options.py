@@ -206,20 +206,24 @@ class MonodepthOptions:
                                  help="if set will perform the flipping post processing "
                                       "from the original monodepth paper",
                                  action="store_true")
-        
-
+        self.parser.add_argument('--save-model', type=str, default='./models/model.pt', help='For Saving the current Model')
+        self.parser.add_argument('--seed', type=int, default=17, metavar='S', help='random seed (default: 17)')
+        self.parser.add_argument('--fp16', action='store_true', help='Run in fp16 mode.')
         self.parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                         metavar='LR', help='initial learning rate')
-
+        self.parser.add_argument('--iters', type=int, default=1, help='How many times the model should be run after each other. Default=1')
         self.parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                             help='momentum')
-
+        self.parser.add_argument('--resume', type=str)
         self.parser.add_argument('--weight-decay', '--wd', default=5.0e-4, type=float,
                             metavar='W', help='weight decay (default: 1e-4)')
         self.parser.add_argument('--image_path', type=str,
                         help='path to a test image or folder of images')
         self.parser.add_argument('--percent', default=0.3, type=float, help='percentage of weight to prune')
-
+        self.parser.add_argument('--decay_frequency', type=int, default=25000)
+        self.parser.add_argument('--decay-schedule', type=str, default='cosine', help='The decay schedule for the pruning rate. Default: cosine. Choose from: cosine, linear.')
+        self.parser.add_argument('--epochs', type=int, default=100, metavar='N',
+                      help='number of epochs to train (default: 100)')
         add_sparse_args(self.parser)
 
     def parse(self):
